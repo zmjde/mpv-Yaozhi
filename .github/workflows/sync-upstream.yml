@@ -1,0 +1,57 @@
+name: sync-upstream
+
+# 上游 Yaozhil/mpv-Yaozhi 有更新时自动同步到本仓库；
+# 上游删除的文件，本仓库保留不删（只增改，不删）。
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"   # 每 6 小时检查一次
+  workflow_dispatch:          # 支持手动触发
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+
+      - name: Fetch upstream snapshot
+        run: |
+          git remote add upstream https://github.com/Yaozhil/mpv-Yaozhi.git || true
+          git fetch --depth=1 upstream main
+          echo "upstream = $(git rev-parse --short upstream/main)"
+
+      - name: Apply upstream files (never delete local files)
+        run: |
+          set -euo pipefail
+          # 只把上游存在的文件覆盖/新增进来，本地独有的文件与上游已删除的文件都原样保留
+          git checkout upstream/main -- .
+          git add -A
+          if git diff --cached --quiet; then
+            echo "SYNC_RESULT=already-in-sync"
+            exit 0
+          fi
+          CHANGED=$(git diff --cached --name-status | head -100)
+          printf '%s\n' "$CHANGED"
+          git commit -m "sync: upstream $(git rev-parse --short upstream/main)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "SYNC_RESULT=pushed"
+
+      - name: Summary
+        if: always()
+        run: git log --oneline -3
