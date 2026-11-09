@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "repository": "zmjde/mpv-Yaozhi",
+  "upstream": "Yaozhil/mpv-Yaozhi",
+  "upstream_branch": "main",
+  "target_branch": "main",
+  "cadence": "每月 4 次（1/8/15/22 日，UTC 03 点档）",
+  "policy": "additive-only; never delete; upstream-unavailable = no-op",
+  "last_check_utc": "2026-11-09T14:04:13+00:00",
+  "last_upstream_sha": "8cbcdc940b064bbb8d9ddca58f9c07ebe148bd04",
+  "last_sync_utc": "2026-11-09T14:04:13+00:00"
+}
