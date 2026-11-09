@@ -1,57 +1,141 @@
 name: sync-upstream
 
-# 上游 Yaozhil/mpv-Yaozhi 有更新时自动同步到本仓库；
-# 上游删除的文件，本仓库保留不删（只增改，不删）。
+# 低频上游同步 · 每月 4 次（1/8/15/22 日，UTC 03 点档）
+# 1) 上游没有新提交：只做一次 ls-remote 探测，零克隆 / 零推送 / 零提交
+# 2) 只增改不删：上游删文件、删库，本仓库一律保留全部内容
+# 3) 受保护路径：同步工作流 / 状态脚本 / 状态文件始终以本仓库版本为准
+# 4) 每月 1 号做一次极小状态提交，避免 GitHub 因 60 天无活动停用定时任务
 
 on:
   schedule:
-    - cron: "23 */6 * * *"   # 每 6 小时检查一次
-  workflow_dispatch:          # 支持手动触发
+    - cron: "37 3 1,8,15,22 * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "忽略 SHA 短路，强制同步一次"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-upstream
+  group: sync-upstream-mpv-Yaozhi
   cancel-in-progress: false
+
+env:
+  UPSTREAM: "Yaozhil/mpv-Yaozhi"
+  UPSTREAM_URL: "https://github.com/Yaozhil/mpv-Yaozhi.git"
+  UPSTREAM_BRANCH: "main"
+  TARGET_BRANCH: "main"
+  CADENCE: "每月 4 次（1/8/15/22 日，UTC 03 点档）"
+  STATE_FILE: ".github/sync-state.json"
+  WORKFLOW_FILE: ".github/workflows/sync-upstream.yml"
+  STATE_SCRIPT: ".github/scripts/sync_state.py"
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout fork
+      - name: Probe upstream (no clone)
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -uo pipefail
+          echo "target = ${GITHUB_REPOSITORY}:${TARGET_BRANCH}"
+
+          HEAD_SHA=$(git ls-remote "${UPSTREAM_URL}" "refs/heads/${UPSTREAM_BRANCH}" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+          if [ -z "${HEAD_SHA}" ]; then
+            echo "gone=true"       >> "$GITHUB_OUTPUT"
+            echo "changed=false"   >> "$GITHUB_OUTPUT"
+            echo "heartbeat=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游 ${UPSTREAM} 不可达（已删库 / 转私有 / 分支消失），本仓库保持原样，不删除任何内容"
+            exit 0
+          fi
+          echo "gone=false"      >> "$GITHUB_OUTPUT"
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+          SAVED_SHA=""
+          if B64=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${STATE_FILE}?ref=${TARGET_BRANCH}" --jq .content 2>/dev/null); then
+            SAVED_SHA=$(printf '%s' "${B64}" | base64 -d | jq -r '.last_upstream_sha // empty' 2>/dev/null || true)
+          fi
+          echo "upstream sha = ${HEAD_SHA}"
+          echo "saved    sha = ${SAVED_SHA:-<none>}"
+
+          if [ "${FORCE}" = "true" ] || [ "${HEAD_SHA}" != "${SAVED_SHA}" ]; then
+            echo "changed=true"    >> "$GITHUB_OUTPUT"
+            echo "heartbeat=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::上游有更新，开始只增改同步"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            if [ "$(date -u +%d)" = "01" ]; then
+              echo "heartbeat=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "heartbeat=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "::notice::上游无变化，跳过克隆与推送"
+          fi
+
+      - name: Checkout target repo
+        if: steps.probe.outputs.changed == 'true' || steps.probe.outputs.heartbeat == 'true'
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: "main"
+          fetch-depth: 1
 
-      - name: Configure git
+      - name: Sync upstream (additive only, never delete)
+        if: steps.probe.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.probe.outputs.sha }}
         run: |
+          set -euo pipefail
           git config user.name "sync-bot"
           git config user.email "sync-bot@users.noreply.github.com"
 
-      - name: Fetch upstream snapshot
-        run: |
-          git remote add upstream https://github.com/Yaozhil/mpv-Yaozhi.git || true
-          git fetch --depth=1 upstream main
-          echo "upstream = $(git rev-parse --short upstream/main)"
+          git remote add upstream "${UPSTREAM_URL}" || true
+          git fetch --depth=1 upstream "${UPSTREAM_BRANCH}"
 
-      - name: Apply upstream files (never delete local files)
-        run: |
-          set -euo pipefail
-          # 只把上游存在的文件覆盖/新增进来，本地独有的文件与上游已删除的文件都原样保留
-          git checkout upstream/main -- .
+          # 只覆盖/新增上游当前存在的文件；上游已删除的文件不会被移除
+          git checkout "upstream/${UPSTREAM_BRANCH}" -- .
+
+          # 受保护路径恢复成本仓库版本，上游无法覆盖或关掉同步
+          for p in "${WORKFLOW_FILE}" "${STATE_SCRIPT}" "${STATE_FILE}"; do
+            git checkout HEAD -- "$p" 2>/dev/null || true
+          done
+
+          python3 "${STATE_SCRIPT}" sync
           git add -A
           if git diff --cached --quiet; then
-            echo "SYNC_RESULT=already-in-sync"
-            exit 0
+            echo "::notice::内容已一致，无新提交"
+          else
+            git commit -m "sync: upstream ${UPSTREAM_SHA:0:7}"
+            git push origin "HEAD:${TARGET_BRANCH}"
+            echo "::notice::已同步 ${UPSTREAM_SHA:0:7}（只增改，未删除任何本地文件）"
           fi
-          CHANGED=$(git diff --cached --name-status | head -100)
-          printf '%s\n' "$CHANGED"
-          git commit -m "sync: upstream $(git rev-parse --short upstream/main)"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-          echo "SYNC_RESULT=pushed"
 
-      - name: Summary
-        if: always()
-        run: git log --oneline -3
+      - name: Monthly heartbeat (keep schedule alive)
+        if: steps.probe.outputs.changed == 'false' && steps.probe.outputs.heartbeat == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.probe.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+          python3 "${STATE_SCRIPT}" heartbeat
+          git add "${STATE_FILE}"
+          if git diff --cached --quiet; then
+            echo "状态无变化"
+          else
+            git commit -m "chore: monthly sync heartbeat"
+            git push origin "HEAD:main"
+            echo "::notice::月初保活提交完成"
+          fi
+
+      - name: Upstream unavailable - untouched
+        if: steps.probe.outputs.gone == 'true'
+        run: |
+          echo "::warning::上游 ${UPSTREAM} 不可达。本次未 clone / 未 fetch / 未 push / 未删除任何内容。"
+          echo "本仓库是 GitHub 官方 fork：删除公开上游仓库不会删除其 fork，历史与文件全部保留。"
