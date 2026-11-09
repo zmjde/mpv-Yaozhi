@@ -5,6 +5,7 @@ name: sync-upstream
 # 2) 只增改不删：上游删文件、删库，本仓库一律保留全部内容
 # 3) 受保护路径：同步工作流 / 状态脚本 / 状态文件始终以本仓库版本为准
 # 4) 每月 1 号做一次极小状态提交，避免 GitHub 因 60 天无活动停用定时任务
+# 5) 上游删库：API 二次确认后，把本 fork 的最后一版自动镜像成一个新的私有仓库
 
 on:
   schedule:
@@ -32,6 +33,8 @@ env:
   STATE_FILE: ".github/sync-state.json"
   WORKFLOW_FILE: ".github/workflows/sync-upstream.yml"
   STATE_SCRIPT: ".github/scripts/sync_state.py"
+  BACKUP_REPO: "zmjde/mpv-Yaozhi-last-snapshot"
+  BACKUP_CREATE_API: "user/repos"
 
 jobs:
   sync:
@@ -139,3 +142,43 @@ jobs:
         run: |
           echo "::warning::上游 ${UPSTREAM} 不可达。本次未 clone / 未 fetch / 未 push / 未删除任何内容。"
           echo "本仓库是 GitHub 官方 fork：删除公开上游仓库不会删除其 fork，历史与文件全部保留。"
+
+      - name: Archive last snapshot into a private repo
+        if: steps.probe.outputs.gone == 'true'
+        env:
+          BACKUP_PAT: ${{ secrets.BACKUP_PAT }}
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BACKUP_PAT}" ]; then
+            echo "::warning::未配置 secret BACKUP_PAT，跳过私库存档（本仓库内容仍完整保留）"
+            exit 0
+          fi
+          # 二次确认：上游仓库本体确实返回 404，排除网络抖动 / 改名 / 默认分支变更
+          if gh api "repos/${UPSTREAM}" --jq .full_name >/dev/null 2>&1; then
+            echo "::warning::上游仓库仍存在（仅分支或网络异常），不触发私库存档"
+            exit 0
+          fi
+          # 已存档过就不再写入，绝不覆盖私库里后续的人工改动
+          if gh api "repos/${BACKUP_REPO}" --jq .full_name >/dev/null 2>&1; then
+            echo "::notice::私库存档 ${BACKUP_REPO} 已存在，保持原样"
+            exit 0
+          fi
+
+          git config --global user.name "sync-bot"
+          git config --global user.email "sync-bot@users.noreply.github.com"
+          git clone --quiet --mirror "https://x-access-token:${BACKUP_PAT}@github.com/${GITHUB_REPOSITORY}.git" /tmp/last-snapshot
+          COMMITS=$(git -C /tmp/last-snapshot rev-list --all --count)
+          echo "::notice::上游 ${UPSTREAM} 已消失，将 ${GITHUB_REPOSITORY} 的最后一版（${COMMITS} 个提交）存档为私库 ${BACKUP_REPO}"
+
+          gh api -X POST "${BACKUP_CREATE_API}" \
+            -f "name=${BACKUP_REPO#*/}" \
+            -F private=true \
+            -f "description=Last snapshot of ${UPSTREAM}; auto-archived when upstream disappeared" \
+            --jq .full_name >/dev/null
+
+          BACKUP_URL="https://x-access-token:${BACKUP_PAT}@github.com/${BACKUP_REPO}.git"
+          git -C /tmp/last-snapshot push --quiet "${BACKUP_URL}" "+refs/heads/*:refs/heads/*"
+          git -C /tmp/last-snapshot push --quiet "${BACKUP_URL}" "+refs/tags/*:refs/tags/*" || true
+          gh api -X PATCH "repos/${BACKUP_REPO}" -f "default_branch=${TARGET_BRANCH}" >/dev/null 2>&1 || true
+          echo "::notice::已保存为私有仓库 https://github.com/${BACKUP_REPO}（含全部分支/标签历史，一次性，不覆盖）"
